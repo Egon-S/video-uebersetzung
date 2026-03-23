@@ -210,6 +210,14 @@ async def download_video_file(url: str, job_dir: Path) -> Path:
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "merge_output_format": "mp4",
         "quiet": True,
+        # YouTube-Bot-Detection umgehen (Cloud-Server-IPs werden oft blockiert)
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "web"],
+            }
+        },
+        "socket_timeout": 30,
+        "retries": 3,
     }
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: _download_sync(url, ydl_opts))
@@ -268,7 +276,7 @@ async def translate_to_german(text: str, api_key: str) -> str:
                         "Du bist ein professioneller Übersetzer. "
                         "Übersetze den folgenden englischen Text ins Deutsche. "
                         "Behalte den Stil, Ton und die Struktur des Originals bei. "
-                        "Gib nur den übersetzten Text zurück, ohne Erklärungen."
+                        "Gib nur den øbersetzten Text zurøck, ohne Erklärungen."
                     ),
                 },
                 {"role": "user", "content": chunk},
