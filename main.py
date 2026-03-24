@@ -4,7 +4,7 @@ Video-Uebersetzungs Microservice
 Wandelt englischsprachige Videos in deutschsprachige Videos um.
 
 Pipeline:
-  1. Video herunterladen (yt-dlp)
+  1. Video herunterladen (yt-dlp) ODER direkt als MP4 hochladen
   2. Audio extrahieren (FFmpeg)
   3. Transkription Englisch (OpenAI Whisper)
   4. Uebersetzung Englisch -> Deutsch (OpenAI GPT-4o)
@@ -24,10 +24,10 @@ from typing import Optional
 
 import yt_dlp
 import openai
-from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
 # ----------------------------------------------
 # Konfiguration (ueber Umgebungsvariablen)
@@ -46,13 +46,13 @@ openai.api_key = OPENAI_API_KEY
 # ----------------------------------------------
 app = FastAPI(
     title="Video-Uebersetzungs API",
-    description="Uebersetzt englische Videos automatisch ins Deutsche.",
-    version="1.1.0",
+    description="Uebersetzt englische Videos automatisch ins Deutsche. Unterstuetzt YouTube-URLs und direkte MP4-Uploads.",
+    version="1.2.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # In Produktion: nur Base44-Domain eintragen
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -72,7 +72,7 @@ class TranslateRequest(BaseModel):
 
 class JobStatus(BaseModel):
     job_id: str
-    status: str          # pending | downloading | extracting | transcribing | translating | synthesizing | merging | done | error
+    status: str          # pending | downloading | uploading | extracting | transcribing | translating | synthesizing | merging | done | error
     progress: int        # 0-100
     step_label: str
     download_url: Optional[str] = None
@@ -82,7 +82,7 @@ class JobStatus(BaseModel):
 # ----------------------------------------------
 # API Endpunkte
 # ----------------------------------------------
-@app.post("/translate", response_model=JobStatus, summary="Uebersetzungsjob starten")
+@app.post("/translate", response_model=JobStatus, summary="Uebersetzungsjob per YouTube-URL starten")
 async def start_translation(req: TranslateRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
@@ -92,10 +92,50 @@ async def start_translation(req: TranslateRequest, background_tasks: BackgroundT
         "download_url": None,
         "error": None,
     }
-    # API Key: Request-Parameter ueberschreibt Umgebungsvariable
     oai_key = req.openai_api_key or OPENAI_API_KEY
+    background_tasks.add_task(process_video_from_url, job_id, req.video_url, oai_key)
+    return JobStatus(job_id=job_id, **jobs[job_id])
 
-    background_tasks.add_task(process_video, job_id, req.video_url, oai_key)
+
+@app.post("/upload-video", response_model=JobStatus, summary="MP4 direkt hochladen und uebersetzen")
+async def upload_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    openai_api_key: Optional[str] = Form(None),
+):
+    """
+    Laedt eine MP4-Datei direkt hoch und startet die Uebersetzungspipeline.
+    Umgeht YouTube-Bot-Detection vollstaendig.
+    Empfohlene maximale Dateigroesse: 200 MB.
+    """
+    job_id = str(uuid.uuid4())
+    job_dir = WORK_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Video auf dem Server speichern
+    jobs[job_id] = {
+        "status": "uploading",
+        "progress": 5,
+        "step_label": "Video wird hochgeladen...",
+        "download_url": None,
+        "error": None,
+    }
+
+    content = await file.read()
+    size_mb = len(content) / (1024 * 1024)
+
+    # Als video.mp4 speichern (unabhaengig vom Original-Dateinamen)
+    video_path = job_dir / "video.mp4"
+    video_path.write_bytes(content)
+
+    jobs[job_id].update({
+        "status": "pending",
+        "progress": 10,
+        "step_label": f"Video empfangen ({size_mb:.1f} MB), Verarbeitung startet...",
+    })
+
+    oai_key = openai_api_key or OPENAI_API_KEY
+    background_tasks.add_task(process_video_pipeline, job_id, video_path, oai_key)
     return JobStatus(job_id=job_id, **jobs[job_id])
 
 
@@ -134,7 +174,6 @@ async def upload_cookies(file: UploadFile = File(...)):
     """
     Laedt eine Netscape-Format cookies.txt hoch, die yt-dlp fuer YouTube nutzt.
     So werden Bot-Detection und Altersbeschraenkungen umgangen.
-    Export-Tool: https://github.com/nickcoutsos/netscape-cookie-file-converter
     """
     content = await file.read()
     COOKIES_FILE.write_bytes(content)
@@ -151,13 +190,14 @@ async def cookies_status():
 
 @app.get("/health", summary="Health Check")
 async def health():
-    return {"status": "ok", "cookies": COOKIES_FILE.exists()}
+    return {"status": "ok", "version": "1.2.0", "cookies": COOKIES_FILE.exists()}
 
 
 # ----------------------------------------------
-# Kernprozess: Video verarbeiten
+# Kernprozesse
 # ----------------------------------------------
-async def process_video(job_id: str, video_url: str, openai_key: str):
+async def process_video_from_url(job_id: str, video_url: str, openai_key: str):
+    """Startet die Pipeline mit YouTube-URL (Schritt 1: Download)."""
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -165,10 +205,26 @@ async def process_video(job_id: str, video_url: str, openai_key: str):
         jobs[job_id].update({"status": status, "progress": progress, "step_label": label})
 
     try:
-        # -- Schritt 1: Video herunterladen --
         update("downloading", 5, "Video wird heruntergeladen...")
         video_path = await download_video_file(video_url, job_dir)
+        await process_video_pipeline(job_id, video_path, openai_key)
+    except Exception as e:
+        jobs[job_id].update({
+            "status": "error",
+            "progress": 0,
+            "step_label": "Fehler aufgetreten",
+            "error": str(e),
+        })
 
+
+async def process_video_pipeline(job_id: str, video_path: Path, openai_key: str):
+    """Gemeinsame Pipeline ab Schritt 2 (Audio-Extraktion). Wird sowohl vom URL- als auch vom Upload-Endpunkt genutzt."""
+    job_dir = video_path.parent
+
+    def update(status: str, progress: int, label: str):
+        jobs[job_id].update({"status": status, "progress": progress, "step_label": label})
+
+    try:
         # -- Schritt 2: Audio extrahieren --
         update("extracting", 20, "Audio wird extrahiert...")
         audio_path = job_dir / "audio.mp3"
@@ -197,11 +253,11 @@ async def process_video(job_id: str, video_url: str, openai_key: str):
         await run_ffmpeg([
             "-i", str(video_path),
             "-i", str(german_audio_path),
-            "-c:v", "copy",          # Video-Stream unveraendert uebernehmen
-            "-c:a", "aac",           # Audio neu kodieren
-            "-map", "0:v:0",         # Video aus Original
-            "-map", "1:a:0",         # Audio aus TTS
-            "-shortest",             # Am kuerzeren Stream enden
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-shortest",
             str(output_path), "-y"
         ])
 
@@ -209,7 +265,7 @@ async def process_video(job_id: str, video_url: str, openai_key: str):
         jobs[job_id].update({
             "status": "done",
             "progress": 100,
-            "step_label": "Uebersetzung abgeschlossen! ",
+            "step_label": "Uebersetzung abgeschlossen!",
             "download_url": f"/download/{job_id}",
         })
 
@@ -233,7 +289,6 @@ async def download_video_file(url: str, job_dir: Path) -> Path:
         "format": "best[height<=720]/best",
         "merge_output_format": "mp4",
         "quiet": True,
-        # YouTube-Bot-Detection umgehen
         "extractor_args": {
             "youtube": {
                 "player_client": ["tv_embedded", "android_creator", "web"],
@@ -242,15 +297,12 @@ async def download_video_file(url: str, job_dir: Path) -> Path:
         "socket_timeout": 30,
         "retries": 3,
     }
-
-    # Cookies verwenden wenn vorhanden (loest Bot-Detection auf Cloud-IPs)
     if COOKIES_FILE.exists():
         ydl_opts["cookiefile"] = str(COOKIES_FILE)
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: _download_sync(url, ydl_opts))
 
-    # Datei finden (Endung kann variieren)
     for f in job_dir.glob("video.*"):
         return f
     raise FileNotFoundError("Video konnte nicht heruntergeladen werden.")
@@ -289,8 +341,6 @@ async def transcribe_audio(audio_path: Path, api_key: str) -> str:
 async def translate_to_german(text: str, api_key: str) -> str:
     """Uebersetzt Text mit OpenAI GPT-4o von Englisch nach Deutsch."""
     client = openai.AsyncOpenAI(api_key=api_key)
-
-    # Lange Texte aufteilen (GPT-4o max. ~120k Tokens, aber kleinere Chunks = bessere Qualitaet)
     chunks = split_text(text, max_length=3000)
     translated_parts = []
 
@@ -319,15 +369,13 @@ async def translate_to_german(text: str, api_key: str) -> str:
 async def synthesize_speech(text: str, output_path: Path, api_key: str):
     """Erstellt deutsche Sprachausgabe mit OpenAI TTS."""
     client = openai.AsyncOpenAI(api_key=api_key)
-
-    # Lange Texte in Abschnitte aufteilen (OpenAI TTS max. ~4096 Zeichen)
     chunks = split_text(text, max_length=4000)
     audio_parts = []
 
     for i, chunk in enumerate(chunks):
         response = await client.audio.speech.create(
             model="tts-1",
-            voice="onyx",   # Stimmen: alloy, echo, fable, onyx, nova, shimmer
+            voice="onyx",
             input=chunk,
         )
         chunk_path = output_path.parent / f"tts_chunk_{i}.mp3"
@@ -337,7 +385,6 @@ async def synthesize_speech(text: str, output_path: Path, api_key: str):
     if len(audio_parts) == 1:
         audio_parts[0].rename(output_path)
     else:
-        # Mehrere Teile zusammenfuegen
         list_file = output_path.parent / "chunks.txt"
         list_file.write_text("\n".join(f"file '{p}'" for p in audio_parts))
         await run_ffmpeg([
